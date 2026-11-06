@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "865212546601",
+    "project_id": "keihi1",
+    "storage_bucket": "keihi1.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:865212546601:android:41f19428140e6c55752638",
+        "android_client_info": {
+          "package_name": "my.keihi.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC5zpN4svDWqM_WVHEhuLCWj9XVqn4DXzA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
