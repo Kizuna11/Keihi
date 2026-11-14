@@ -5,6 +5,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'memory.dart';
 import 'models.dart';
 import 'services.dart';
 
@@ -176,25 +177,128 @@ class LoginScreen extends StatefulWidget {
   State<LoginScreen> createState() => _LoginScreenState();
 }
 
+/// Which field a Firebase Auth error belongs to, and a plain message for it.
+enum _AuthField { email, password, other }
+
+(_AuthField, String) _authError(FirebaseAuthException e) => switch (e.code) {
+      // Firebase reports 'invalid-credential' for both a wrong password and an unknown email,
+      // so it can't reveal which emails have accounts.
+      'invalid-credential' || 'invalid-login-credentials' =>
+        (_AuthField.password, 'Wrong email or password. Check them and try again.'),
+      'wrong-password' => (_AuthField.password, 'Incorrect password. Try again or reset it.'),
+      'user-not-found' => (_AuthField.email, 'No account uses this email. Register instead?'),
+      'invalid-email' => (_AuthField.email, 'Enter a valid email address.'),
+      'missing-email' => (_AuthField.email, 'Enter your email.'),
+      'email-already-in-use' => (_AuthField.email, 'An account already uses this email. Log in instead.'),
+      'missing-password' => (_AuthField.password, 'Enter your password.'),
+      'weak-password' || 'password-does-not-meet-requirements' =>
+        (_AuthField.password, 'Password is too weak. Use at least 6 characters.'),
+      'user-disabled' => (_AuthField.other, 'This account has been disabled.'),
+      'too-many-requests' => (_AuthField.other, 'Too many attempts. Wait a few minutes or reset your password.'),
+      'network-request-failed' => (_AuthField.other, 'No internet connection. Check it and try again.'),
+      _ => (_AuthField.other, e.message ?? 'Something went wrong. Please try again.'),
+    };
+
+/// Sends a Firebase password reset email after confirming the address with the user.
+Future<void> _resetPassword(BuildContext context, String email) async {
+  final ctl = TextEditingController(text: email.trim());
+  String? error;
+  var busy = false;
+  final sentTo = await showDialog<String>(
+    context: context,
+    builder: (c) => StatefulBuilder(
+      builder: (c, setState) => AlertDialog(
+        title: const Text('Reset password'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text("Enter your account's email. We'll send you a link to set a new password."),
+          const SizedBox(height: 16),
+          TextField(
+            controller: ctl,
+            autofocus: ctl.text.isEmpty,
+            keyboardType: TextInputType.emailAddress,
+            decoration: InputDecoration(
+                labelText: 'Email', prefixIcon: const Icon(Icons.email_outlined), errorText: error),
+            onChanged: (_) => setState(() => error = null),
+          ),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: busy
+                ? null
+                : () async {
+                    final e = ctl.text.trim();
+                    if (e.isEmpty) return setState(() => error = 'Enter your email.');
+                    setState(() => busy = true);
+                    try {
+                      await FirebaseAuth.instance.sendPasswordResetEmail(email: e);
+                      if (c.mounted) Navigator.pop(c, e);
+                    } on FirebaseAuthException catch (ex) {
+                      setState(() {
+                        busy = false;
+                        error = _authError(ex).$2;
+                      });
+                    }
+                  },
+            child: const Text('Send link'),
+          ),
+        ],
+      ),
+    ),
+  );
+  if (sentTo == null || !context.mounted) return;
+  await showDialog<void>(
+    context: context,
+    builder: (c) => AlertDialog(
+      icon: const Icon(Icons.mark_email_read_outlined),
+      title: const Text('Check your email'),
+      content: Text('If an account exists for $sentTo, we sent a link to reset the password. '
+          'Open it, choose a new password, then log in here. Check your spam folder if you can\'t find it.'),
+      actions: [TextButton(onPressed: () => Navigator.pop(c), child: const Text('OK'))],
+    ),
+  );
+}
+
 class _LoginScreenState extends State<LoginScreen> {
   final _name = TextEditingController(), _email = TextEditingController(), _pass = TextEditingController();
-  bool _register = false, _busy = false;
+  bool _register = false, _busy = false, _showPass = false;
+  String? _emailError, _passError, _error;
 
   Future<void> _submit() async {
+    final email = _email.text.trim();
+    setState(() {
+      _emailError = email.isEmpty ? 'Enter your email.' : null;
+      _passError = _pass.text.isEmpty ? 'Enter your password.' : null;
+      _error = null;
+    });
+    if (_emailError != null || _passError != null) return;
     setState(() => _busy = true);
     try {
       final auth = FirebaseAuth.instance;
       if (_register) {
-        final c = await auth.createUserWithEmailAndPassword(email: _email.text.trim(), password: _pass.text);
+        final c = await auth.createUserWithEmailAndPassword(email: email, password: _pass.text);
         await c.user?.updateDisplayName(_name.text.trim());
         await Repo.saveProfile({'name': _name.text.trim(), 'currency': 'MYR', 'monthlyBudget': 0.0});
       } else {
-        await auth.signInWithEmailAndPassword(email: _email.text.trim(), password: _pass.text);
+        await auth.signInWithEmailAndPassword(email: email, password: _pass.text);
       }
     } on FirebaseAuthException catch (e) {
-      if (mounted) _snack(context, e.message ?? 'Authentication failed');
+      final (field, msg) = _authError(e);
+      if (mounted) {
+        setState(() {
+          if (field == _AuthField.email) _emailError = msg;
+          if (field == _AuthField.password) _passError = msg;
+          if (field == _AuthField.other) _error = msg;
+        });
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  void _clearErrors() {
+    if (_emailError != null || _passError != null || _error != null) {
+      setState(() => _emailError = _passError = _error = null);
     }
   }
 
@@ -224,22 +328,67 @@ class _LoginScreenState extends State<LoginScreen> {
             TextField(
                 controller: _email,
                 keyboardType: TextInputType.emailAddress,
-                decoration: const InputDecoration(
-                    labelText: 'Email', prefixIcon: Icon(Icons.email_outlined), border: OutlineInputBorder())),
+                autofillHints: const [AutofillHints.email],
+                onChanged: (_) => _clearErrors(),
+                decoration: InputDecoration(
+                    labelText: 'Email',
+                    prefixIcon: const Icon(Icons.email_outlined),
+                    errorText: _emailError,
+                    border: const OutlineInputBorder())),
             const SizedBox(height: 12),
             TextField(
                 controller: _pass,
-                obscureText: true,
-                decoration: const InputDecoration(
-                    labelText: 'Password', prefixIcon: Icon(Icons.lock_outline), border: OutlineInputBorder())),
-            const SizedBox(height: 20),
+                obscureText: !_showPass,
+                autofillHints: [_register ? AutofillHints.newPassword : AutofillHints.password],
+                onChanged: (_) => _clearErrors(),
+                onSubmitted: (_) => _busy ? null : _submit(),
+                decoration: InputDecoration(
+                    labelText: 'Password',
+                    prefixIcon: const Icon(Icons.lock_outline),
+                    helperText: _register ? 'At least 6 characters' : null,
+                    errorText: _passError,
+                    errorMaxLines: 2,
+                    suffixIcon: IconButton(
+                      tooltip: _showPass ? 'Hide password' : 'Show password',
+                      icon: Icon(_showPass ? Icons.visibility_off : Icons.visibility),
+                      onPressed: () => setState(() => _showPass = !_showPass),
+                    ),
+                    border: const OutlineInputBorder())),
+            if (!_register)
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                    onPressed: () => _resetPassword(context, _email.text), child: const Text('Forgot password?')),
+              )
+            else
+              const SizedBox(height: 12),
+            if (_error != null) ...[
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(color: cs.errorContainer, borderRadius: BorderRadius.circular(12)),
+                child: Row(children: [
+                  Icon(Icons.error_outline, color: cs.onErrorContainer),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text(_error!, style: TextStyle(color: cs.onErrorContainer))),
+                ]),
+              ),
+              const SizedBox(height: 12),
+            ],
+            const SizedBox(height: 8),
             SizedBox(
               width: double.infinity,
               child: FilledButton(
-                  onPressed: _busy ? null : _submit, child: Text(_register ? 'Register' : 'Log in')),
+                  onPressed: _busy ? null : _submit,
+                  child: _busy
+                      ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                      : Text(_register ? 'Register' : 'Log in')),
             ),
             TextButton(
-                onPressed: () => setState(() => _register = !_register),
+                onPressed: () => setState(() {
+                      _register = !_register;
+                      _emailError = _passError = _error = null;
+                    }),
                 child: Text(_register ? 'Have an account? Log in' : 'No account? Register')),
           ]),
         ),
@@ -279,35 +428,152 @@ class _HomeShellState extends State<HomeShell> {
 
 // ───────────── UC02: Financial ledger dashboard ─────────────
 
-/// Numbers shown on the dashboard, all for the current month unless noted.
+DateTime _monthOf(DateTime d) => DateTime(d.year, d.month);
+String _monthLabel(DateTime m) => '${_months[m.month - 1]} ${m.year}';
+bool _inMonth(Txn t, DateTime m) => t.date.year == m.year && t.date.month == m.month;
+
+/// Grid of months for one year, with arrows to change year. Months after this one are disabled.
+/// Returns the chosen month; with [allowAll], `DateTime(0)` means "all time".
+Future<DateTime?> _pickMonth(BuildContext context, DateTime? initial, {bool allowAll = false}) {
+  final now = _monthOf(DateTime.now());
+  var year = (initial ?? now).year;
+  return showDialog<DateTime>(
+    context: context,
+    builder: (c) => StatefulBuilder(
+      builder: (c, setState) {
+        final cs = Theme.of(c).colorScheme;
+        return AlertDialog(
+          title: Row(children: [
+            IconButton(
+                onPressed: year > 2020 ? () => setState(() => year--) : null, icon: const Icon(Icons.chevron_left)),
+            Expanded(child: Text('$year', textAlign: TextAlign.center)),
+            IconButton(
+                onPressed: year < now.year ? () => setState(() => year++) : null,
+                icon: const Icon(Icons.chevron_right)),
+          ]),
+          content: SizedBox(
+            width: 300,
+            child: GridView.count(
+              shrinkWrap: true,
+              crossAxisCount: 3,
+              childAspectRatio: 2,
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              children: [
+                for (var m = 1; m <= 12; m++)
+                  Builder(builder: (_) {
+                    final d = DateTime(year, m);
+                    final label = Text(_months[m - 1].substring(0, 3));
+                    if (initial != null && d == _monthOf(initial)) {
+                      return FilledButton(onPressed: () => Navigator.pop(c, d), child: label);
+                    }
+                    return OutlinedButton(
+                        onPressed: d.isAfter(now) ? null : () => Navigator.pop(c, d),
+                        style: OutlinedButton.styleFrom(side: BorderSide(color: cs.outlineVariant)),
+                        child: label);
+                  }),
+              ],
+            ),
+          ),
+          actions: [
+            if (allowAll) TextButton(onPressed: () => Navigator.pop(c, DateTime(0)), child: const Text('All time')),
+            TextButton(onPressed: () => Navigator.pop(c, now), child: const Text('This month')),
+          ],
+        );
+      },
+    ),
+  );
+}
+
+/// "‹  November 2026  ›" with a month picker in the middle. [month] null means all time (only with [allowAll]).
+class _MonthBar extends StatelessWidget {
+  final DateTime? month;
+  final ValueChanged<DateTime?> onChanged;
+  final bool allowAll;
+  const _MonthBar({required this.month, required this.onChanged, this.allowAll = false});
+
+  @override
+  Widget build(BuildContext context) {
+    final m = month;
+    final now = _monthOf(DateTime.now());
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+      child: Row(children: [
+        IconButton(
+            tooltip: 'Previous month',
+            onPressed: m == null ? null : () => onChanged(DateTime(m.year, m.month - 1)),
+            icon: const Icon(Icons.chevron_left)),
+        Expanded(
+          child: TextButton.icon(
+            onPressed: () async {
+              final d = await _pickMonth(context, m, allowAll: allowAll);
+              if (d != null) onChanged(d.year == 0 ? null : d);
+            },
+            icon: const Icon(Icons.calendar_month),
+            label: Text(m == null ? 'All time' : _monthLabel(m), style: Theme.of(context).textTheme.titleMedium),
+          ),
+        ),
+        IconButton(
+            tooltip: 'Next month',
+            onPressed: m == null || !m.isBefore(now) ? null : () => onChanged(DateTime(m.year, m.month + 1)),
+            icon: const Icon(Icons.chevron_right)),
+      ]),
+    );
+  }
+}
+
+/// Numbers shown on the dashboard for the selected [month].
 class _Stats {
-  final double month, today, week, dailyAvg;
-  final int count;
+  final DateTime month;
+  final bool isCurrent;
+  final List<Txn> txns; // in the month, newest first
+  final double total, today, week, dailyAvg, relief;
   final Map<String, double> byCat;
   final List<double> daily; // index 0 = day 1
 
-  factory _Stats(List<Txn> all, DateTime now) {
-    final start = DateTime(now.year, now.month);
+  factory _Stats(List<Txn> all, DateTime month, DateTime now) {
+    final isCurrent = month == _monthOf(now);
     final today = DateTime(now.year, now.month, now.day);
     final weekStart = today.subtract(const Duration(days: 6));
-    final inMonth = all.where((t) => !t.date.isBefore(start) && t.date.month == now.month).toList();
-    final daily = List<double>.filled(DateUtils.getDaysInMonth(now.year, now.month), 0);
+    final txns = all.where((t) => _inMonth(t, month)).toList();
+    final days = DateUtils.getDaysInMonth(month.year, month.month);
+    final daily = List<double>.filled(days, 0);
     final byCat = <String, double>{};
-    for (final t in inMonth) {
+    for (final t in txns) {
       daily[t.date.day - 1] += t.amount;
       byCat[t.category] = (byCat[t.category] ?? 0) + t.amount;
     }
-    final month = inMonth.fold<double>(0, (a, t) => a + t.amount);
+    final total = txns.fold<double>(0, (a, t) => a + t.amount);
     double sumFrom(DateTime from) => all.where((t) => !t.date.isBefore(from)).fold(0, (a, t) => a + t.amount);
-    return _Stats._(month, sumFrom(today), sumFrom(weekStart), month / now.day, inMonth.length, byCat, daily);
+    return _Stats._(month, isCurrent, txns, total, sumFrom(today), sumFrom(weekStart),
+        total / (isCurrent ? now.day : days), txns.fold(0, (a, t) => a + t.reliefTotal), byCat, daily);
   }
 
-  _Stats._(this.month, this.today, this.week, this.dailyAvg, this.count, this.byCat, this.daily);
+  _Stats._(this.month, this.isCurrent, this.txns, this.total, this.today, this.week, this.dailyAvg, this.relief,
+      this.byCat, this.daily);
+
+  int get count => txns.length;
+
+  /// Day of the month with the most spending (1-based), or 0 if nothing was spent.
+  int get topDay {
+    var best = 0;
+    for (var i = 0; i < daily.length; i++) {
+      if (daily[i] > 0 && (best == 0 || daily[i] > daily[best - 1])) best = i + 1;
+    }
+    return best;
+  }
 }
 
-class LedgerPage extends StatelessWidget {
+class LedgerPage extends StatefulWidget {
   final VoidCallback onScan, onProfile;
   const LedgerPage({super.key, required this.onScan, required this.onProfile});
+
+  @override
+  State<LedgerPage> createState() => _LedgerPageState();
+}
+
+class _LedgerPageState extends State<LedgerPage> {
+  DateTime _month = _monthOf(DateTime.now());
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -320,34 +586,36 @@ class LedgerPage extends StatelessWidget {
                 if (s.hasError) return Center(child: Text('Failed to load: ${s.error}'));
                 if (!s.hasData) return const Center(child: CircularProgressIndicator());
                 final all = s.data!;
-                final now = DateTime.now();
-                final st = _Stats(all, now);
+                final st = _Stats(all, _month, DateTime.now());
                 final budget = ((p.data?['monthlyBudget']) as num?)?.toDouble() ?? 0;
                 final name = (p.data?['name'] ?? '') as String;
+                void seeAll() =>
+                    Navigator.push(context, MaterialPageRoute(builder: (_) => TransactionsPage(month: _month)));
                 return ListView(padding: const EdgeInsets.only(bottom: 16), children: [
                   ListTile(
-                    contentPadding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-                    leading: GestureDetector(onTap: onProfile, child: _Avatar(p.data, radius: 22)),
+                    contentPadding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                    leading: GestureDetector(onTap: widget.onProfile, child: _Avatar(p.data, radius: 22)),
                     title: Text(name.isEmpty ? 'Hi there' : 'Hi, $name',
                         style: Theme.of(context).textTheme.titleLarge),
-                    subtitle: Text('${_months[now.month - 1]} ${now.year}'),
                   ),
-                  _BudgetCard(spent: st.month, budget: budget, onSetBudget: onProfile),
+                  _MonthBar(month: _month, onChanged: (m) => setState(() => _month = m!)),
+                  _BudgetCard(st: st, budget: budget, onSetBudget: widget.onProfile, onTap: seeAll),
                   _StatGrid(st),
-                  if (st.month > 0) _CategoryCard(st),
+                  if (st.total > 0) _CategoryCard(st),
+                  _ReliefCard(all: all, year: _month.year),
                   _Section(
-                    title: 'Recent transactions',
-                    trailing: all.length > 5
-                        ? TextButton(
-                            onPressed: () => Navigator.push(
-                                context, MaterialPageRoute(builder: (_) => const TransactionsPage())),
-                            child: const Text('See all'))
-                        : null,
+                    title: st.isCurrent ? 'Recent transactions' : 'Transactions in ${_months[_month.month - 1]}',
+                    trailing: st.count > 0 ? TextButton(onPressed: seeAll, child: const Text('See all')) : null,
                     child: all.isEmpty
-                        ? _EmptyTxns(onScan: onScan)
-                        : Column(children: [for (final t in all.take(5)) _TxnTile(t)]),
+                        ? _EmptyTxns(onScan: widget.onScan)
+                        : st.txns.isEmpty
+                            ? Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 8),
+                                child: Text('No transactions in ${_monthLabel(_month)}.',
+                                    style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant)))
+                            : Column(children: [for (final t in st.txns.take(5)) _TxnTile(t)]),
                   ),
-                  _DailyChart(st.daily, now),
+                  if (st.total > 0) _DailyChart(st),
                 ]);
               },
             ),
@@ -357,58 +625,75 @@ class LedgerPage extends StatelessWidget {
 }
 
 class _BudgetCard extends StatelessWidget {
-  final double spent, budget;
-  final VoidCallback onSetBudget;
-  const _BudgetCard({required this.spent, required this.budget, required this.onSetBudget});
+  final _Stats st;
+  final double budget;
+  final VoidCallback onSetBudget, onTap;
+  const _BudgetCard({required this.st, required this.budget, required this.onSetBudget, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final tt = Theme.of(context).textTheme;
+    final spent = st.total;
     final over = budget > 0 && spent > budget;
     final onCard = cs.onPrimary;
     return Card(
       margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
       clipBehavior: Clip.antiAlias,
-      child: Container(
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-              colors: [cs.primary, Color.lerp(cs.primary, cs.tertiary, 0.6)!],
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight),
-        ),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('Spent this month', style: tt.titleSmall?.copyWith(color: onCard.withValues(alpha: 0.85))),
-          const SizedBox(height: 4),
-          Text(_rm(spent), style: tt.displaySmall?.copyWith(color: onCard, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 16),
-          if (budget > 0) ...[
-            ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: LinearProgressIndicator(
-                minHeight: 10,
-                value: (spent / budget).clamp(0, 1).toDouble(),
-                backgroundColor: onCard.withValues(alpha: 0.25),
-                color: over ? Colors.redAccent : onCard,
-              ),
-            ),
-            const SizedBox(height: 8),
+      child: InkWell(
+        onTap: onTap,
+        child: Ink(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+                colors: [cs.primary, Color.lerp(cs.primary, cs.tertiary, 0.6)!],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight),
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Row(children: [
               Expanded(
-                child: Text(over ? '${_rm(spent - budget)} over budget' : '${_rm(budget - spent)} left',
-                    style: tt.bodyMedium?.copyWith(color: onCard, fontWeight: FontWeight.w600)),
+                child: Text(st.isCurrent ? 'Total spent this month' : 'Total spent in ${_monthLabel(st.month)}',
+                    style: tt.titleSmall?.copyWith(color: onCard.withValues(alpha: 0.85))),
               ),
-              Text('Budget ${_rm(budget)}', style: tt.bodySmall?.copyWith(color: onCard.withValues(alpha: 0.85))),
+              Icon(Icons.chevron_right, color: onCard.withValues(alpha: 0.85)),
             ]),
-          ] else
-            OutlinedButton.icon(
-              onPressed: onSetBudget,
-              style: OutlinedButton.styleFrom(foregroundColor: onCard, side: BorderSide(color: onCard)),
-              icon: const Icon(Icons.savings_outlined),
-              label: const Text('Set a monthly budget'),
+            const SizedBox(height: 4),
+            FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Text(_rm(spent), style: tt.displaySmall?.copyWith(color: onCard, fontWeight: FontWeight.bold)),
             ),
-        ]),
+            Text('${st.count} receipt${st.count == 1 ? '' : 's'}',
+                style: tt.bodySmall?.copyWith(color: onCard.withValues(alpha: 0.85))),
+            const SizedBox(height: 16),
+            if (budget > 0) ...[
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: LinearProgressIndicator(
+                  minHeight: 10,
+                  value: (spent / budget).clamp(0, 1).toDouble(),
+                  backgroundColor: onCard.withValues(alpha: 0.25),
+                  color: over ? Colors.redAccent : onCard,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Row(children: [
+                Expanded(
+                  child: Text(over ? '${_rm(spent - budget)} over budget' : '${_rm(budget - spent)} left',
+                      style: tt.bodyMedium?.copyWith(color: onCard, fontWeight: FontWeight.w600)),
+                ),
+                Text('Budget ${_rm(budget)}', style: tt.bodySmall?.copyWith(color: onCard.withValues(alpha: 0.85))),
+              ]),
+            ] else
+              OutlinedButton.icon(
+                onPressed: onSetBudget,
+                style: OutlinedButton.styleFrom(foregroundColor: onCard, side: BorderSide(color: onCard)),
+                icon: const Icon(Icons.savings_outlined),
+                label: const Text('Set a monthly budget'),
+              ),
+          ]),
+        ),
       ),
     );
   }
@@ -419,22 +704,36 @@ class _StatGrid extends StatelessWidget {
   const _StatGrid(this.st);
 
   @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-        child: Column(children: [
-          Row(children: [
-            Expanded(child: _StatCard(icon: Icons.today, label: 'Today', value: _rm(st.today))),
-            const SizedBox(width: 12),
-            Expanded(child: _StatCard(icon: Icons.date_range, label: 'Last 7 days', value: _rm(st.week))),
-          ]),
-          const SizedBox(height: 12),
-          Row(children: [
-            Expanded(child: _StatCard(icon: Icons.show_chart, label: 'Daily average', value: _rm(st.dailyAvg))),
-            const SizedBox(width: 12),
-            Expanded(child: _StatCard(icon: Icons.receipt, label: 'Receipts this month', value: '${st.count}')),
-          ]),
+  Widget build(BuildContext context) {
+    final top = st.topDay;
+    final mon = _months[st.month.month - 1].substring(0, 3);
+    // Today and the last 7 days only make sense for the current month; past months show their busiest day.
+    final first = st.isCurrent
+        ? [
+            _StatCard(icon: Icons.today, label: 'Today', value: _rm(st.today)),
+            _StatCard(icon: Icons.date_range, label: 'Last 7 days', value: _rm(st.week)),
+          ]
+        : [
+            _StatCard(
+                icon: Icons.local_fire_department,
+                label: top == 0 ? 'Highest day' : 'Highest day ($top $mon)',
+                value: _rm(top == 0 ? 0 : st.daily[top - 1])),
+            _StatCard(icon: Icons.receipt, label: 'Receipts', value: '${st.count}'),
+          ];
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+      child: Column(children: [
+        Row(children: [Expanded(child: first[0]), const SizedBox(width: 12), Expanded(child: first[1])]),
+        const SizedBox(height: 12),
+        Row(children: [
+          Expanded(child: _StatCard(icon: Icons.show_chart, label: 'Daily average', value: _rm(st.dailyAvg))),
+          const SizedBox(width: 12),
+          Expanded(
+              child: _StatCard(icon: Icons.volunteer_activism, label: 'Tax relief items', value: _rm(st.relief))),
         ]),
-      );
+      ]),
+    );
+  }
 }
 
 class _StatCard extends StatelessWidget {
@@ -491,7 +790,7 @@ class _CategoryCard extends StatelessWidget {
                   Icon(_catIcon(e.key), size: 18, color: _catColor(e.key)),
                   const SizedBox(width: 8),
                   Expanded(child: Text(e.key)),
-                  Text('${(e.value / st.month * 100).round()}%',
+                  Text('${(e.value / st.total * 100).round()}%',
                       style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant, fontSize: 12)),
                   const SizedBox(width: 8),
                   Text(_rm(e.value), style: const TextStyle(fontWeight: FontWeight.w600)),
@@ -505,19 +804,21 @@ class _CategoryCard extends StatelessWidget {
 }
 
 class _DailyChart extends StatelessWidget {
-  final List<double> daily;
-  final DateTime now;
-  const _DailyChart(this.daily, this.now);
+  final _Stats st;
+  const _DailyChart(this.st);
 
   static String _compact(double v) => v >= 1000 ? '${(v / 1000).toStringAsFixed(1)}k' : v.toStringAsFixed(0);
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final daily = st.daily;
+    final month = st.month;
+    final highlight = st.isCurrent ? DateTime.now().day : st.topDay;
     final maxY = math.max(10.0, daily.reduce(math.max) * 1.2);
     final label = TextStyle(fontSize: 10, color: cs.onSurfaceVariant);
     return _Section(
-      title: 'Daily spending in ${_months[now.month - 1]}',
+      title: 'Daily spending in ${_monthLabel(month)}',
       child: SizedBox(
         height: 200,
         child: BarChart(BarChartData(
@@ -554,7 +855,7 @@ class _DailyChart extends StatelessWidget {
             touchTooltipData: BarTouchTooltipData(
               getTooltipColor: (_) => cs.inverseSurface,
               getTooltipItem: (g, _, rod, _) => BarTooltipItem(
-                  '${g.x} ${_months[now.month - 1].substring(0, 3)}\n${_rm(rod.toY)}',
+                  '${g.x} ${_months[month.month - 1].substring(0, 3)}\n${_rm(rod.toY)}',
                   TextStyle(color: cs.onInverseSurface, fontSize: 12)),
             ),
           ),
@@ -565,7 +866,7 @@ class _DailyChart extends StatelessWidget {
                   toY: daily[i],
                   width: 6,
                   borderRadius: const BorderRadius.vertical(top: Radius.circular(3)),
-                  color: i + 1 == now.day ? cs.primary : cs.primary.withValues(alpha: 0.45),
+                  color: i + 1 == highlight ? cs.primary : cs.primary.withValues(alpha: 0.45),
                 ),
               ]),
           ],
@@ -631,22 +932,246 @@ class _TxnTile extends StatelessWidget {
       );
 }
 
-class TransactionsPage extends StatelessWidget {
-  const TransactionsPage({super.key});
+/// Transactions filtered by month (or all time) and category, with the total for the filter at the top.
+class TransactionsPage extends StatefulWidget {
+  final DateTime? month; // null = all time
+  const TransactionsPage({super.key, this.month});
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(title: const Text('All transactions')),
-        body: StreamBuilder<List<Txn>>(
-          stream: Repo.txns(),
-          builder: (c, s) {
-            if (!s.hasData) return const Center(child: CircularProgressIndicator());
-            return ListView(
+  State<TransactionsPage> createState() => _TransactionsPageState();
+}
+
+class _TransactionsPageState extends State<TransactionsPage> {
+  late DateTime? _month = widget.month;
+  String? _cat; // null = all categories
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Transactions')),
+      body: StreamBuilder<List<Txn>>(
+        stream: Repo.txns(),
+        builder: (c, s) {
+          if (!s.hasData) return const Center(child: CircularProgressIndicator());
+          final m = _month;
+          final inPeriod = m == null ? s.data! : s.data!.where((t) => _inMonth(t, m)).toList();
+          final cats = {for (final t in inPeriod) t.category}.toList()..sort();
+          final list = _cat == null ? inPeriod : inPeriod.where((t) => t.category == _cat).toList();
+          final total = list.fold<double>(0, (a, t) => a + t.amount);
+          final relief = list.fold<double>(0, (a, t) => a + t.reliefTotal);
+          return ListView(padding: const EdgeInsets.only(bottom: 16), children: [
+            _MonthBar(
+                month: m,
+                allowAll: true,
+                onChanged: (v) => setState(() {
+                      _month = v;
+                      _cat = null;
+                    })),
+            Card(
+              margin: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+              color: cs.primaryContainer,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Row(children: [
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text(_cat == null ? 'Total spent' : 'Total spent on $_cat',
+                          style: tt.titleSmall?.copyWith(color: cs.onPrimaryContainer)),
+                      FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.centerLeft,
+                        child: Text(_rm(total),
+                            style: tt.headlineMedium
+                                ?.copyWith(color: cs.onPrimaryContainer, fontWeight: FontWeight.bold)),
+                      ),
+                      Text(
+                          '${list.length} receipt${list.length == 1 ? '' : 's'}'
+                          '${relief > 0 ? ' • ${_rm(relief)} tax relief items' : ''}',
+                          style: tt.bodySmall?.copyWith(color: cs.onPrimaryContainer)),
+                    ]),
+                  ),
+                  Icon(Icons.account_balance_wallet_outlined, size: 36, color: cs.onPrimaryContainer),
+                ]),
+              ),
+            ),
+            if (cats.length > 1)
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                child: Row(children: [
+                  for (final k in [null, ...cats])
+                    Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: ChoiceChip(
+                        avatar: k == null ? null : Icon(_catIcon(k), size: 18, color: _catColor(k)),
+                        label: Text(k ?? 'All'),
+                        selected: _cat == k,
+                        onSelected: (_) => setState(() => _cat = k),
+                      ),
+                    ),
+                ]),
+              ),
+            if (list.isEmpty)
+              Padding(
+                padding: const EdgeInsets.all(32),
+                child: Text('No transactions in ${m == null ? 'your ledger' : _monthLabel(m)}.',
+                    textAlign: TextAlign.center, style: TextStyle(color: cs.onSurfaceVariant)),
+              )
+            else
+              Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
-                children: [for (final t in s.data!) _TxnTile(t)]);
-          },
+                child: Column(children: [for (final t in list) _TxnTile(t)]),
+              ),
+          ]);
+        },
+      ),
+    );
+  }
+}
+
+// ───────────── Tax relief (LHDN) ─────────────
+
+const _reliefIcons = {
+  'Lifestyle': Icons.menu_book,
+  'Sports': Icons.sports_tennis,
+  'Medical': Icons.medical_services,
+  'Parents medical': Icons.elderly,
+  'Disability equipment': Icons.accessible,
+  'Education': Icons.school,
+  'Childcare': Icons.child_care,
+  'Breastfeeding': Icons.baby_changing_station,
+  'Tourism': Icons.attractions,
+  'EV & home': Icons.ev_station,
+  'Insurance': Icons.shield,
+};
+
+IconData _reliefIcon(String key) => _reliefIcons[key] ?? Icons.volunteer_activism;
+
+/// Tagged items for [year], grouped by relief: relief key → (transaction, item) pairs.
+Map<String, List<(Txn, TxnItem)>> _reliefItems(List<Txn> all, int year) {
+  final out = <String, List<(Txn, TxnItem)>>{};
+  for (final t in all) {
+    if (t.date.year != year) continue;
+    for (final i in t.items) {
+      if (i.relief.isNotEmpty) (out[i.relief] ??= []).add((t, i));
+    }
+  }
+  return out;
+}
+
+class _ReliefBar extends StatelessWidget {
+  final Relief r;
+  final double claimed;
+  const _ReliefBar(this.r, this.claimed);
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final full = claimed >= r.limit;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(_reliefIcon(r.key), size: 18, color: cs.primary),
+          const SizedBox(width: 8),
+          Expanded(child: Text(r.key)),
+          Text('${_rm(claimed)} / ${_rm(r.limit)}',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: full ? cs.tertiary : null)),
+        ]),
+        const SizedBox(height: 4),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: LinearProgressIndicator(
+              minHeight: 6, value: (claimed / r.limit).clamp(0, 1).toDouble(), color: full ? cs.tertiary : null),
         ),
-      );
+      ]),
+    );
+  }
+}
+
+class _ReliefCard extends StatelessWidget {
+  final List<Txn> all;
+  final int year;
+  const _ReliefCard({required this.all, required this.year});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final items = _reliefItems(all, year);
+    final sums = {for (final e in items.entries) e.key: e.value.fold<double>(0, (a, p) => a + p.$2.price)};
+    final total = sums.values.fold<double>(0, (a, v) => a + v);
+    return _Section(
+      title: 'Tax relief $year',
+      trailing: TextButton(
+          onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ReliefPage(year: year))),
+          child: const Text('Details')),
+      child: total == 0
+          ? Text(
+              'No tax relief items yet. Books, gadgets, sports gear, medical bills and similar items are '
+              'tagged automatically when you scan a receipt.',
+              style: TextStyle(color: cs.onSurfaceVariant))
+          : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('${_rm(total)} in receipts you may be able to claim',
+                  style: const TextStyle(fontWeight: FontWeight.w600)),
+              const SizedBox(height: 4),
+              for (final r in kReliefs)
+                if ((sums[r.key] ?? 0) > 0) _ReliefBar(r, sums[r.key]!),
+            ]),
+    );
+  }
+}
+
+/// Every tagged item for a year, grouped by relief, with the YA limits.
+class ReliefPage extends StatelessWidget {
+  final int year;
+  const ReliefPage({super.key, required this.year});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Scaffold(
+      appBar: AppBar(title: Text('Tax relief $year')),
+      body: StreamBuilder<List<Txn>>(
+        stream: Repo.txns(),
+        builder: (c, s) {
+          if (!s.hasData) return const Center(child: CircularProgressIndicator());
+          final items = _reliefItems(s.data!, year);
+          return ListView(padding: const EdgeInsets.only(top: 8, bottom: 16), children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              child: Text(
+                'Limits shown are for year of assessment $kReliefYear'
+                '${year == kReliefYear ? '' : ' and may differ for $year'}. '
+                'AI tags are a guide only: check each item against LHDN rules and keep the original receipts '
+                'for 7 years. Medical bills for parents must be tagged by hand on the receipt.',
+                style: TextStyle(color: cs.onSurfaceVariant, fontSize: 12),
+              ),
+            ),
+            for (final r in kReliefs)
+              _Section(
+                title: r.key,
+                trailing: Icon(_reliefIcon(r.key), color: cs.primary),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(r.covers, style: TextStyle(color: cs.onSurfaceVariant, fontSize: 12)),
+                  _ReliefBar(r, (items[r.key] ?? const []).fold(0, (a, p) => a + p.$2.price)),
+                  for (final (t, i) in items[r.key] ?? const <(Txn, TxnItem)>[])
+                    ListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: Text(i.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      subtitle: Text('${t.store.isEmpty ? '(no store name)' : t.store} • ${_day(t.date)}'),
+                      trailing: Text(_rm(i.price), style: const TextStyle(fontWeight: FontWeight.w600)),
+                      onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ReviewPage.edit(t))),
+                    ),
+                ]),
+              ),
+          ]);
+        },
+      ),
+    );
+  }
 }
 
 // ───────────── UC03 / UC04: Scan or upload → OCR → Gemini ─────────────
@@ -671,14 +1196,21 @@ class _ScanPageState extends State<ScanPage> {
       });
       final text = await OcrService().read(_image!);
       if (text.trim().isEmpty) {
-        if (mounted) _snack(context, 'No text found. Retake the photo in better lighting.');
+        if (mounted) _invalid('No text was found in this image. It may not be a receipt, or it is too dark or blurry.');
         return;
       }
       setState(() => _step = 2);
-      final aliases = await Repo.storeAliases();
-      final parsed = await GeminiService().parse(text,
-          image: _image, knownStores: aliases.values.toSet().take(50).toList(), categories: await Repo.categories());
+      final memories = await Repo.storeMemories();
+      var parsed = await GeminiService().parse(text,
+          image: _image, pastReceipts: memoryHints(memories.values), categories: await Repo.categories());
       if (!mounted) return;
+      if (!parsed.isReceipt) {
+        _invalid(parsed.notReceiptReason);
+        return;
+      }
+      // Fill in what the user chose last time at this store (category, total row, tax relief tags...).
+      final memory = Repo.memoryFor(memories, parsed.store);
+      if (memory != null) parsed = applyMemory(parsed, memory, text);
       await Navigator.push(
           context,
           MaterialPageRoute(
@@ -686,11 +1218,31 @@ class _ScanPageState extends State<ScanPage> {
                   parsed: parsed,
                   rawText: text,
                   image: _image,
-                  storeAlias: aliases[Repo.storeKey(parsed.store)])));
+                  storeAlias: memory == null || memory.to.isEmpty ? null : memory.to)));
     } catch (e) {
       if (mounted) _snack(context, 'Scan failed: $e');
     } finally {
       if (mounted) setState(() => _step = 0);
+    }
+  }
+
+  /// Tells the user the image isn't a receipt and lets them scan or pick another one straight away.
+  Future<void> _invalid(String reason) async {
+    final next = await showDialog<ImageSource>(
+      context: context,
+      builder: (c) => AlertDialog(
+        icon: Icon(Icons.image_not_supported_outlined, color: Theme.of(c).colorScheme.error),
+        title: const Text('Invalid image'),
+        content: Text('$reason\n\nPlease scan or upload a clear photo of a receipt.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(c, ImageSource.gallery), child: const Text('Upload another')),
+          FilledButton(onPressed: () => Navigator.pop(c, ImageSource.camera), child: const Text('Scan again')),
+        ],
+      ),
+    );
+    if (next != null && mounted) {
+      _pick(next);
     }
   }
 
@@ -865,10 +1417,6 @@ class _ReviewPageState extends State<ReviewPage> {
 
   late final _store = TextEditingController(text: _e?.store ?? widget.storeAlias ?? _p!.store);
   late final _amount = TextEditingController(text: _fmt(_e?.amount ?? _p!.total));
-  late final _receiptNo = TextEditingController(text: _e?.receiptNo ?? _p!.receiptNo);
-  late final _tax = TextEditingController(text: _fmt(_e != null ? _e.tax : _p!.tax));
-  late final _service = TextEditingController(text: _fmt(_e != null ? _e.serviceCharge : _p!.serviceCharge));
-  late final _discount = TextEditingController(text: _fmt(_e != null ? _e.discount : _p!.discount));
   late DateTime _date = _clampDate(_e?.date ?? _p!.date);
   late String _cat = _e?.category ?? _p!.category;
   late String _payment = _e?.payment ?? _p!.payment;
@@ -894,6 +1442,15 @@ class _ReviewPageState extends State<ReviewPage> {
 
   bool get _catIsNew => !_categories.contains(_cat);
 
+  /// Shows where the scanned total came from, or warns when it isn't in the receipt text at all.
+  String? get _totalHint {
+    final p = _p;
+    if (p == null || p.total == null) return null;
+    if (!p.totalInText) return 'This amount wasn\'t found in the receipt text. Check it against the photo.';
+    if (p.remembered.contains('total')) return 'Read from: "${p.totalLabel}", the row you used last time at this store';
+    return p.totalLabel.isEmpty ? null : 'Read from: "${p.totalLabel}"';
+  }
+
   Future<void> _save() async {
     final amt = double.tryParse(_amount.text.trim());
     if (amt == null || amt <= 0) return _snack(context, 'Enter a valid amount');
@@ -905,10 +1462,10 @@ class _ReviewPageState extends State<ReviewPage> {
       category: _cat,
       rawText: _e?.rawText ?? widget.rawText,
       payment: _payment,
-      receiptNo: _receiptNo.text.trim(),
-      tax: double.tryParse(_tax.text.trim()),
-      serviceCharge: double.tryParse(_service.text.trim()),
-      discount: double.tryParse(_discount.text.trim()),
+      // Not shown on screen any more, but kept: the receipt number powers the duplicate check.
+      receiptNo: _e?.receiptNo ?? _p!.receiptNo,
+      serviceCharge: _e != null ? _e.serviceCharge : _p!.serviceCharge,
+      discount: _e != null ? _e.discount : _p!.discount,
       items: _items,
     );
     if (!_editing && await Repo.isDuplicate(t)) {
@@ -929,7 +1486,8 @@ class _ReviewPageState extends State<ReviewPage> {
       if (ok != true) return;
     }
     if (_catIsNew) Repo.addCategory(_cat);
-    if (_p != null && _p.store.isNotEmpty) Repo.learnStore(_p.store, t.store);
+    // Learn from what was saved, so the next receipt from this store is filled in the same way.
+    if (t.store.isNotEmpty) Repo.remember(t, detected: _p?.store ?? '');
     // Not awaited: Firestore's local cache updates at once and syncs when online (UC08 exception flow).
     _editing ? Repo.update(t) : Repo.add(t);
     if (mounted) Navigator.pop(context);
@@ -967,6 +1525,7 @@ class _ReviewPageState extends State<ReviewPage> {
     final name = TextEditingController(text: old?.name ?? '');
     final qty = TextEditingController(text: old == null ? '1' : _qty(old.qty));
     final price = TextEditingController(text: _fmt(old?.price));
+    var relief = old?.relief ?? '';
     final item = await showDialog<TxnItem>(
       context: context,
       builder: (c) => AlertDialog(
@@ -987,6 +1546,25 @@ class _ReviewPageState extends State<ReviewPage> {
                     keyboardType: const TextInputType.numberWithOptions(decimal: true),
                     decoration: const InputDecoration(labelText: 'Line total', prefixText: 'RM '))),
           ]),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<String>(
+            initialValue: relief,
+            isExpanded: true,
+            decoration: const InputDecoration(labelText: 'Tax relief ($kReliefYear)'),
+            items: [
+              const DropdownMenuItem(value: '', child: Text('None')),
+              for (final r in kReliefs)
+                DropdownMenuItem(
+                  value: r.key,
+                  child: Row(children: [
+                    Icon(_reliefIcon(r.key), size: 18),
+                    const SizedBox(width: 8),
+                    Expanded(child: Text('${r.key} (max ${_rm(r.limit)})', overflow: TextOverflow.ellipsis)),
+                  ]),
+                ),
+            ],
+            onChanged: (v) => relief = v ?? '',
+          ),
         ]),
         actions: [
           TextButton(onPressed: () => Navigator.pop(c), child: const Text('Cancel')),
@@ -995,7 +1573,12 @@ class _ReviewPageState extends State<ReviewPage> {
                 final p = double.tryParse(price.text.trim());
                 if (name.text.trim().isEmpty || p == null) return;
                 Navigator.pop(
-                    c, TxnItem(name: name.text.trim(), qty: double.tryParse(qty.text.trim()) ?? 1, price: p));
+                    c,
+                    TxnItem(
+                        name: name.text.trim(),
+                        qty: double.tryParse(qty.text.trim()) ?? 1,
+                        price: p,
+                        relief: relief));
               },
               child: const Text('OK')),
         ],
@@ -1011,6 +1594,17 @@ class _ReviewPageState extends State<ReviewPage> {
           clipBehavior: Clip.antiAlias,
           child: InteractiveViewer(child: Image.file(widget.image!)),
         ),
+      );
+
+  bool _remembered(String field) => _p?.remembered.contains(field) ?? false;
+
+  Widget _rememberedNote(ColorScheme cs, [String text = 'From your past receipts at this store.']) => Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Row(children: [
+          Icon(Icons.history, size: 16, color: cs.primary),
+          const SizedBox(width: 6),
+          Expanded(child: Text(text, style: TextStyle(color: cs.primary, fontSize: 13))),
+        ]),
       );
 
   Widget _heading(String text, {Widget? trailing}) => Padding(
@@ -1052,6 +1646,7 @@ class _ReviewPageState extends State<ReviewPage> {
     const money = TextInputType.numberWithOptions(decimal: true);
     final chips = [..._categories, ..._extra.where((c) => !_categories.contains(c))];
     final itemsTotal = _items.fold<double>(0, (a, i) => a + i.price);
+    final reliefTotal = _items.where((i) => i.relief.isNotEmpty).fold<double>(0, (a, i) => a + i.price);
     return Scaffold(
       appBar: AppBar(
         title: Text(_editing ? 'Edit Transaction' : 'Review Receipt'),
@@ -1092,8 +1687,14 @@ class _ReviewPageState extends State<ReviewPage> {
         TextField(
             controller: _amount,
             keyboardType: money,
-            decoration: const InputDecoration(
-                labelText: 'Total', prefixText: 'RM ', prefixIcon: Icon(Icons.payments_outlined), border: border)),
+            decoration: InputDecoration(
+                labelText: 'Total',
+                prefixText: 'RM ',
+                prefixIcon: const Icon(Icons.payments_outlined),
+                helperText: _totalHint,
+                helperMaxLines: 3,
+                helperStyle: _p != null && !_p.totalInText ? TextStyle(color: cs.error) : null,
+                border: border)),
         const SizedBox(height: 12),
         InkWell(
           borderRadius: BorderRadius.circular(4),
@@ -1109,7 +1710,8 @@ class _ReviewPageState extends State<ReviewPage> {
         ),
 
         _heading('Category'),
-        if (_p != null && _catIsNew && _cat == _p.category)
+        if (_remembered('category')) _rememberedNote(cs),
+        if (_p != null && _catIsNew && _cat == _p.category && !_remembered('category'))
           Padding(
             padding: const EdgeInsets.only(bottom: 8),
             child: Text('AI suggested a new category "$_cat". Keep it or pick another.',
@@ -1130,6 +1732,7 @@ class _ReviewPageState extends State<ReviewPage> {
         ]),
 
         _heading('Payment method'),
+        if (_remembered('payment')) _rememberedNote(cs, 'Not printed on this receipt, so using how you paid last time.'),
         Wrap(spacing: 8, runSpacing: 8, children: [
           for (final k in kPayments)
             ChoiceChip(
@@ -1138,32 +1741,6 @@ class _ReviewPageState extends State<ReviewPage> {
               selected: _payment == k,
               onSelected: (s) => setState(() => _payment = s ? k : ''),
             ),
-        ]),
-
-        _heading('Receipt details'),
-        TextField(
-            controller: _receiptNo,
-            decoration: const InputDecoration(
-                labelText: 'Receipt / invoice no.', prefixIcon: Icon(Icons.tag), border: border)),
-        const SizedBox(height: 12),
-        Row(children: [
-          Expanded(
-              child: TextField(
-                  controller: _tax,
-                  keyboardType: money,
-                  decoration: const InputDecoration(labelText: 'SST (RM)', border: border))),
-          const SizedBox(width: 8),
-          Expanded(
-              child: TextField(
-                  controller: _service,
-                  keyboardType: money,
-                  decoration: const InputDecoration(labelText: 'Service (RM)', border: border))),
-          const SizedBox(width: 8),
-          Expanded(
-              child: TextField(
-                  controller: _discount,
-                  keyboardType: money,
-                  decoration: const InputDecoration(labelText: 'Discount (RM)', border: border))),
         ]),
 
         _heading('Items (${_items.length})',
@@ -1179,6 +1756,16 @@ class _ReviewPageState extends State<ReviewPage> {
               onTap: () => _editItem(i),
               leading: Text('${_qty(_items[i].qty)}×', style: const TextStyle(fontWeight: FontWeight.w600)),
               title: Text(_items[i].name),
+              subtitle: _items[i].relief.isEmpty
+                  ? null
+                  : Row(children: [
+                      Icon(_reliefIcon(_items[i].relief), size: 14, color: cs.primary),
+                      const SizedBox(width: 4),
+                      Flexible(
+                        child: Text('Tax relief: ${_items[i].relief}',
+                            style: TextStyle(color: cs.primary, fontSize: 12), overflow: TextOverflow.ellipsis),
+                      ),
+                    ]),
               trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                 Text(_rm(_items[i].price)),
                 IconButton(
@@ -1189,12 +1776,245 @@ class _ReviewPageState extends State<ReviewPage> {
             ),
           Text('Items add up to ${_rm(itemsTotal)}',
               style: TextStyle(color: cs.onSurfaceVariant, fontSize: 12), textAlign: TextAlign.right),
+          if (reliefTotal > 0)
+            Text('Tax relief items: ${_rm(reliefTotal)}',
+                style: TextStyle(color: cs.primary, fontSize: 12, fontWeight: FontWeight.w600),
+                textAlign: TextAlign.right),
+          if (_remembered('relief'))
+            Text('Some tax relief tags are from your past receipts at this store.',
+                style: TextStyle(color: cs.primary, fontSize: 12), textAlign: TextAlign.right),
+          Text('Tap an item to change its tax relief.',
+              style: TextStyle(color: cs.onSurfaceVariant, fontSize: 12), textAlign: TextAlign.right),
         ],
 
         const SizedBox(height: 28),
         FilledButton.icon(
             onPressed: _save, icon: const Icon(Icons.check), label: Text(_editing ? 'Save changes' : 'Save')),
         TextButton(onPressed: () => Navigator.pop(context), child: Text(_editing ? 'Cancel' : 'Discard')),
+      ]),
+    );
+  }
+}
+
+// ───────────── Learned stores ─────────────
+
+/// Everything the app remembers per store, with a way to forget a store or everything.
+class LearnedStoresPage extends StatelessWidget {
+  const LearnedStoresPage({super.key});
+
+  Future<bool> _confirm(BuildContext context, String title, String body) async =>
+      await showDialog<bool>(
+        context: context,
+        builder: (c) => AlertDialog(
+          title: Text(title),
+          content: Text(body),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+            TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('Forget')),
+          ],
+        ),
+      ) ==
+      true;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return StreamBuilder<List<StoreMemory>>(
+      stream: Repo.storeMemoriesStream(),
+      builder: (c, s) {
+        final list = s.data ?? const <StoreMemory>[];
+        return Scaffold(
+          appBar: AppBar(title: const Text('Learned stores'), actions: [
+            if (list.isNotEmpty)
+              TextButton(
+                onPressed: () async {
+                  if (await _confirm(context, 'Forget everything?',
+                      'Keihi will stop filling in details from your past receipts. Saved transactions are not deleted.')) {
+                    await Repo.forgetAllStores();
+                  }
+                },
+                child: const Text('Forget all'),
+              ),
+          ]),
+          body: !s.hasData
+              ? const Center(child: CircularProgressIndicator())
+              : ListView(padding: const EdgeInsets.all(16), children: [
+                  Text(
+                    'When you save a receipt, Keihi remembers your choices for that store and fills them in next time. '
+                    'This stays in your account and is not used to train the AI.',
+                    style: TextStyle(color: cs.onSurfaceVariant, fontSize: 13),
+                  ),
+                  const SizedBox(height: 12),
+                  if (list.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Text('Nothing learned yet. Scan and save a receipt to start.',
+                          textAlign: TextAlign.center, style: TextStyle(color: cs.onSurfaceVariant)),
+                    ),
+                  for (final m in list)
+                    Card(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      child: ListTile(
+                        leading: CircleAvatar(
+                          backgroundColor: _catColor(m.category).withValues(alpha: 0.15),
+                          child: Icon(_catIcon(m.category), color: _catColor(m.category)),
+                        ),
+                        title: Text(m.name.isEmpty ? '(no store name)' : m.name),
+                        subtitle: Text(
+                          [
+                            if (m.to.isNotEmpty && m.from.isNotEmpty) 'Printed as "${m.from}"',
+                            if (m.category.isNotEmpty) m.category,
+                            if (m.payment.isNotEmpty) m.payment,
+                            if (m.totalLabel.isNotEmpty) 'Total row "${m.totalLabel}"',
+                            if (m.items.values.any((i) => i.relief.isNotEmpty))
+                              '${m.items.values.where((i) => i.relief.isNotEmpty).length} tax relief items',
+                            if (m.scans > 0) '${m.scans} scan${m.scans == 1 ? '' : 's'}',
+                          ].join(' • '),
+                        ),
+                        trailing: IconButton(
+                          tooltip: 'Forget this store',
+                          icon: const Icon(Icons.delete_outline),
+                          onPressed: () async {
+                            if (await _confirm(context, 'Forget ${m.name}?',
+                                'The next receipt from this store will be read without your past choices.')) {
+                              await Repo.forgetStore(m.key);
+                            }
+                          },
+                        ),
+                      ),
+                    ),
+                ]),
+        );
+      },
+    );
+  }
+}
+
+// ───────────── Change password ─────────────
+
+/// Firebase needs a recent sign-in to change a password, so the current password is checked first.
+class ChangePasswordPage extends StatefulWidget {
+  const ChangePasswordPage({super.key});
+  @override
+  State<ChangePasswordPage> createState() => _ChangePasswordPageState();
+}
+
+class _ChangePasswordPageState extends State<ChangePasswordPage> {
+  final _current = TextEditingController(), _new = TextEditingController(), _confirm = TextEditingController();
+  String? _currentError, _newError, _confirmError, _error;
+  bool _busy = false, _show = false;
+
+  Future<void> _save() async {
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _currentError = _current.text.isEmpty ? 'Enter your current password.' : null;
+      _newError = _new.text.length < 6
+          ? 'Use at least 6 characters.'
+          : _new.text == _current.text
+              ? 'Choose a password different from your current one.'
+              : null;
+      _confirmError = _confirm.text != _new.text ? 'Passwords don\'t match.' : null;
+      _error = null;
+    });
+    if (_currentError != null || _newError != null || _confirmError != null) return;
+    final user = FirebaseAuth.instance.currentUser!;
+    setState(() => _busy = true);
+    try {
+      await user.reauthenticateWithCredential(
+          EmailAuthProvider.credential(email: user.email!, password: _current.text));
+    } on FirebaseAuthException catch (e) {
+      final (field, msg) = _authError(e);
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          // A wrong password here is always the current one.
+          field == _AuthField.other
+              ? _error = msg
+              : _currentError =
+                  e.code == 'invalid-credential' || e.code == 'wrong-password' ? 'Incorrect current password.' : msg;
+        });
+      }
+      return;
+    }
+    try {
+      await user.updatePassword(_new.text);
+      if (!mounted) return;
+      _snack(context, 'Password changed');
+      Navigator.pop(context);
+    } on FirebaseAuthException catch (e) {
+      final (field, msg) = _authError(e);
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          field == _AuthField.password ? _newError = msg : _error = msg;
+        });
+      }
+    }
+  }
+
+  Widget _field(TextEditingController c, String label, String? error, {String? helper, bool last = false}) =>
+      TextField(
+        controller: c,
+        obscureText: !_show,
+        textInputAction: last ? TextInputAction.done : TextInputAction.next,
+        onSubmitted: last ? (_) => _busy ? null : _save() : null,
+        onChanged: (_) {
+          if (error != null || _error != null) {
+            setState(() => _currentError = _newError = _confirmError = _error = null);
+          }
+        },
+        decoration: InputDecoration(
+          labelText: label,
+          prefixIcon: const Icon(Icons.lock_outline),
+          helperText: helper,
+          errorText: error,
+          errorMaxLines: 2,
+          border: const OutlineInputBorder(),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Change password')),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        _field(_current, 'Current password', _currentError),
+        Align(
+          alignment: Alignment.centerRight,
+          child: TextButton(
+              onPressed: () => _resetPassword(context, FirebaseAuth.instance.currentUser?.email ?? ''),
+              child: const Text('Forgot current password?')),
+        ),
+        _field(_new, 'New password', _newError, helper: 'At least 6 characters'),
+        const SizedBox(height: 12),
+        _field(_confirm, 'Confirm new password', _confirmError, last: true),
+        CheckboxListTile(
+          contentPadding: EdgeInsets.zero,
+          controlAffinity: ListTileControlAffinity.leading,
+          value: _show,
+          onChanged: (v) => setState(() => _show = v ?? false),
+          title: const Text('Show passwords'),
+        ),
+        if (_error != null) ...[
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(color: cs.errorContainer, borderRadius: BorderRadius.circular(12)),
+            child: Row(children: [
+              Icon(Icons.error_outline, color: cs.onErrorContainer),
+              const SizedBox(width: 8),
+              Expanded(child: Text(_error!, style: TextStyle(color: cs.onErrorContainer))),
+            ]),
+          ),
+          const SizedBox(height: 12),
+        ],
+        const SizedBox(height: 8),
+        FilledButton(
+          onPressed: _busy ? null : _save,
+          child: _busy
+              ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+              : const Text('Change password'),
+        ),
       ]),
     );
   }
@@ -1377,6 +2197,17 @@ class _ProfilePageState extends State<ProfilePage> {
               ]),
             ),
             _Section(
+              title: 'What Keihi has learned',
+              child: ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.history),
+                title: const Text('Learned stores'),
+                subtitle: const Text('Names, categories, total rows and tax relief choices from your saved receipts'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const LearnedStoresPage())),
+              ),
+            ),
+            _Section(
               title: 'Appearance',
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 SizedBox(
@@ -1414,6 +2245,13 @@ class _ProfilePageState extends State<ProfilePage> {
             _Section(
               title: 'Account',
               child: Column(children: [
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.password),
+                  title: const Text('Change password'),
+                  onTap: () =>
+                      Navigator.push(context, MaterialPageRoute(builder: (_) => const ChangePasswordPage())),
+                ),
                 ListTile(
                   contentPadding: EdgeInsets.zero,
                   leading: const Icon(Icons.logout),
